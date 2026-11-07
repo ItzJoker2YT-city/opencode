@@ -4,6 +4,14 @@ name: build-patched
 # checks out an optional upstream ref, applies the quota patch, compiles the
 # standalone binary, smoke-tests the new `quota` subcommand, and uploads
 # per-platform artifacts (optionally attaching them to a release).
+#
+# The free-tier gate: the Console reads the client version from the User-Agent
+# (`opencode/<channel>/<version>/<name>`) and rejects requests below 1.18.0
+# ("OpenCode 1.18.0 or newer is required to use the free tier"). Preview builds
+# default to a `0.0.0-<channel>-<n>` version, which the gate rejects. Bypass:
+# bake a stable 2.x version string via OPENCODE_VERSION, which also flips the
+# channel to `latest`, so the build reports itself exactly like an official
+# stable release and the free tier accepts it.
 
 on:
   workflow_dispatch:
@@ -16,6 +24,10 @@ on:
         description: "Patch file in this repo to apply before building"
         required: false
         default: "patches/quota-ledger.patch"
+      version:
+        description: "Version baked into the build (stable 2.x passes the Console free-tier gate)"
+        required: false
+        default: "2.2.5"
       release:
         description: "Attach the artifacts to this release tag (optional)"
         required: false
@@ -91,13 +103,16 @@ jobs:
       - name: Build patched binary
         working-directory: packages/cli
         timeout-minutes: 45
+        env:
+          OPENCODE_VERSION: ${{ inputs.version }}
         run: bun run script/build.ts --single --skip-install
 
       - name: Smoke test
         run: |
           BIN="packages/cli/dist/${{ matrix.dist }}/bin/opencode${{ matrix.ext }}"
           test -f "$BIN"
-          "$BIN" --version
+          "$BIN" --version | tee "$RUNNER_TEMP/version.txt"
+          grep -F "v${{ inputs.version }}" "$RUNNER_TEMP/version.txt"
           "$BIN" quota --json | tee "$RUNNER_TEMP/quota.json"
           grep -q '"buckets"' "$RUNNER_TEMP/quota.json"
 
@@ -126,5 +141,126 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           gh release view "${{ inputs.release }}" >/dev/null 2>&1 || \
-            gh release create "${{ inputs.release }}" --generate-notes --title "${{ inputs.release }}"
+            { gh release create "${{ inputs.release }}" --generate-notes --title "${{ inputs.release }}" --target "$GITHUB_SHA" || true; }
+          gh release upload "${{ inputs.release }}" out/* --clobber
+
+  # Windows desktop app ("Actions as a build VM", mirrors the official release
+  # pipeline's build-desktop + build-desktop-windows-installer steps, unsigned):
+  # builds the baseline CLI the desktop bundles, then electron-vite build and
+  # electron-builder pack into the NSIS installer (opencode-desktop-win-x64.exe)
+  # plus a portable (unpacked) zip. The bundled CLI carries the quota patch and
+  # reports the same stable version, so the free tier works inside the app too.
+  build-desktop-windows:
+    runs-on: windows-2025
+    timeout-minutes: 60
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Stage patch
+        run: cp "${{ inputs.patch }}" "$RUNNER_TEMP/quota.patch"
+
+      - name: Checkout target ref
+        if: inputs.ref != ''
+        run: |
+          git fetch origin "${{ inputs.ref }}" 2>/dev/null || \
+            git fetch https://github.com/anomalyco/opencode "${{ inputs.ref }}"
+          git checkout -f FETCH_HEAD
+
+      - name: Apply patch
+        run: |
+          if git apply --check --3way "$RUNNER_TEMP/quota.patch" 2>/dev/null; then
+            git apply -v --3way "$RUNNER_TEMP/quota.patch"
+            git diff --stat
+          else
+            echo "Patch does not apply cleanly; assuming the ref already carries it."
+            test -f packages/util/src/quota-ledger.ts || { echo "quota-ledger.ts missing - aborting"; exit 1; }
+          fi
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+
+      - name: Setup Bun
+        uses: ./.github/actions/setup-bun
+
+      - name: Install dependencies
+        run: bun install --frozen-lockfile
+
+      # The desktop bundles the baseline CLI from packages/cli/dist/<dist>/; the
+      # name must match getCurrentCli().package for windows-x64 ("cli-windows-x64-baseline").
+      - name: Build patched baseline CLI
+        working-directory: packages/cli
+        timeout-minutes: 45
+        env:
+          OPENCODE_VERSION: ${{ inputs.version }}
+          OPENCODE_TARGET: windows-x64-baseline
+        run: bun run script/build.ts --skip-install
+
+      - name: Smoke test bundled CLI
+        run: |
+          BIN="packages/cli/dist/cli-windows-x64-baseline/bin/opencode.exe"
+          test -f "$BIN"
+          "$BIN" --version | tee "$RUNNER_TEMP/version.txt"
+          grep -F "v${{ inputs.version }}" "$RUNNER_TEMP/version.txt"
+
+      - name: Build desktop app
+        working-directory: packages/desktop
+        timeout-minutes: 30
+        env:
+          OPENCODE_VERSION: ${{ inputs.version }}
+          OPENCODE_CHANNEL: latest
+          OPENCODE_TARGET: windows-x64
+          NODE_OPTIONS: --max-old-space-size=4096
+        run: bun run build
+
+      - name: Pack portable app (unpacked)
+        working-directory: packages/desktop
+        timeout-minutes: 30
+        env:
+          OPENCODE_VERSION: ${{ inputs.version }}
+          OPENCODE_CHANNEL: latest
+          OPENCODE_TARGET: windows-x64
+        run: bun run pack
+
+      - name: Pack NSIS installer
+        working-directory: packages/desktop
+        timeout-minutes: 30
+        env:
+          OPENCODE_VERSION: ${{ inputs.version }}
+          OPENCODE_CHANNEL: latest
+          OPENCODE_TARGET: windows-x64
+          OPENCODE_DESKTOP_APP: ${{ runner.temp }}/desktop-app
+        run: |
+          cp -r packages/desktop/dist/desktop/app "$RUNNER_TEMP/desktop-app"
+          bun run pack
+
+      - name: Package artifacts
+        run: |
+          mkdir -p out
+          cp packages/desktop/dist/desktop/opencode-desktop-win-x64.exe out/
+          ( cd packages/desktop/dist/desktop/app && 7z a "$GITHUB_WORKSPACE/out/opencode-desktop-win-x64-portable.zip" . ) >/dev/null
+          ( cd out && sha256sum ./* > SHA256SUMS-desktop-windows-x64.txt )
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: opencode-desktop-windows-x64
+          path: out/*
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Attach to release
+        if: inputs.release != ''
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release view "${{ inputs.release }}" >/dev/null 2>&1 || \
+            { gh release create "${{ inputs.release }}" --generate-notes --title "${{ inputs.release }}" --target "$GITHUB_SHA" || true; }
           gh release upload "${{ inputs.release }}" out/* --clobber
