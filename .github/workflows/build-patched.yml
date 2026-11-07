@@ -79,10 +79,13 @@ jobs:
             git fetch https://github.com/anomalyco/opencode "${{ inputs.ref }}"
           git checkout -f FETCH_HEAD
 
+      # The patch snapshots .github/workflows/build-patched.yml as a new file; this branch carries its own
+      # (newer) version of it, so re-applying that hunk conflicts and exits 1. CI-meta files are irrelevant
+      # to the build, so exclude them from the patch application.
       - name: Apply patch
         run: |
-          if git apply --check --3way "$RUNNER_TEMP/quota.patch" 2>/dev/null; then
-            git apply -v --3way "$RUNNER_TEMP/quota.patch"
+          if git apply --exclude=".github/*" --check --3way "$RUNNER_TEMP/quota.patch" 2>/dev/null; then
+            git apply -v --exclude=".github/*" --3way "$RUNNER_TEMP/quota.patch"
             git diff --stat
           else
             echo "Patch does not apply cleanly; assuming the ref already carries it."
@@ -172,10 +175,12 @@ jobs:
             git fetch https://github.com/anomalyco/opencode "${{ inputs.ref }}"
           git checkout -f FETCH_HEAD
 
+      # Same .github/* exclusion as the build job: the patch's workflow hunk conflicts with this branch's
+      # own (newer) build-patched.yml and is irrelevant to the build.
       - name: Apply patch
         run: |
-          if git apply --check --3way "$RUNNER_TEMP/quota.patch" 2>/dev/null; then
-            git apply -v --3way "$RUNNER_TEMP/quota.patch"
+          if git apply --exclude=".github/*" --check --3way "$RUNNER_TEMP/quota.patch" 2>/dev/null; then
+            git apply -v --exclude=".github/*" --3way "$RUNNER_TEMP/quota.patch"
             git diff --stat
           else
             echo "Patch does not apply cleanly; assuming the ref already carries it."
@@ -238,14 +243,19 @@ jobs:
           OPENCODE_TARGET: windows-x64
           OPENCODE_DESKTOP_APP: ${{ runner.temp }}/desktop-app
         run: |
-          cp -r packages/desktop/dist/desktop/app "$RUNNER_TEMP/desktop-app"
+          # pack.ts writes the unpacked app to <repo-root>/dist/desktop/app and wipes that dir when it
+          # starts, so preserve a copy outside the tree for the installer run (as the official pipeline
+          # does via artifacts).
+          cp -r ../../dist/desktop/app "$RUNNER_TEMP/desktop-app"
           bun run pack
 
       - name: Package artifacts
         run: |
+          # pack.ts leaves the installer in <repo-root>/dist/desktop and removed the unpacked app/ there
+          # (each pack run wipes that dir first); the portable zip is built from the preserved copy.
           mkdir -p out
-          cp packages/desktop/dist/desktop/opencode-desktop-win-x64.exe out/
-          ( cd packages/desktop/dist/desktop/app && 7z a "$GITHUB_WORKSPACE/out/opencode-desktop-win-x64-portable.zip" . ) >/dev/null
+          cp dist/desktop/opencode-desktop-win-x64.exe out/
+          ( cd "$RUNNER_TEMP/desktop-app" && 7z a "$GITHUB_WORKSPACE/out/opencode-desktop-win-x64-portable.zip" . ) >/dev/null
           ( cd out && sha256sum ./* > SHA256SUMS-desktop-windows-x64.txt )
 
       - name: Upload artifact
