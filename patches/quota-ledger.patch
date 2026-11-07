@@ -112,7 +112,7 @@ index 0000000..a476bc2
 +          NAME="opencode-${{ matrix.plat }}-quota"
 +          mkdir -p out
 +          if [ -n "${{ matrix.ext }}" ]; then
-+            ( cd "packages/cli/dist/${{ matrix.dist }}/bin" && 7z a "../../../out/$NAME.zip" "opencode.exe" ) >/dev/null
++            ( cd "packages/cli/dist/${{ matrix.dist }}/bin" && 7z a "$GITHUB_WORKSPACE/out/$NAME.zip" "opencode.exe" ) >/dev/null
 +          else
 +            tar -czf "out/$NAME.tar.gz" -C "packages/cli/dist/${{ matrix.dist }}/bin" .
 +          fi
