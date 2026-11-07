@@ -44,7 +44,7 @@ jobs:
             ext: ""
           - os: windows-2025
             plat: windows-x64
-            dist: cli-win32-x64
+            dist: cli-windows-x64
             ext: ".exe"
     runs-on: ${{ matrix.os }}
     timeout-minutes: 60
