@@ -1,0 +1,124 @@
+name: build-patched
+
+# Builds the patched CLI on GitHub runners ("Actions as a build VM"):
+# checks out an optional upstream ref, applies the quota patch, compiles the
+# standalone binary, smoke-tests the new `quota` subcommand, and uploads
+# per-platform artifacts (optionally attaching them to a release).
+
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: "Git ref to build (branch/tag/sha). Empty = the ref dispatched from."
+        required: false
+        default: ""
+      patch:
+        description: "Patch file in this repo to apply before building"
+        required: false
+        default: "patches/quota-ledger.patch"
+      release:
+        description: "Attach the artifacts to this release tag (optional)"
+        required: false
+        default: ""
+
+concurrency:
+  group: build-patched-${{ github.ref }}-${{ inputs.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-24.04
+            plat: linux-x64
+            dist: cli-linux-x64
+            ext: ""
+          - os: ubuntu-24.04-arm
+            plat: linux-arm64
+            dist: cli-linux-arm64
+            ext: ""
+          - os: windows-2025
+            plat: windows-x64
+            dist: cli-win32-x64
+            ext: ".exe"
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Stage patch
+        run: cp "${{ inputs.patch }}" "$RUNNER_TEMP/quota.patch"
+
+      - name: Checkout target ref
+        if: inputs.ref != ''
+        run: |
+          git fetch origin "${{ inputs.ref }}"
+          git checkout -f FETCH_HEAD
+
+      - name: Apply patch
+        run: |
+          git apply -v --3way "$RUNNER_TEMP/quota.patch"
+          git diff --stat
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+
+      - name: Setup Bun
+        uses: ./.github/actions/setup-bun
+
+      - name: Install dependencies
+        run: bun install --frozen-lockfile
+
+      - name: Build patched binary
+        working-directory: packages/cli
+        timeout-minutes: 45
+        run: bun run script/build.ts --single --skip-install
+
+      - name: Smoke test
+        run: |
+          BIN="packages/cli/dist/${{ matrix.dist }}/bin/opencode${{ matrix.ext }}"
+          test -f "$BIN"
+          "$BIN" --version
+          "$BIN" quota --json | tee "$RUNNER_TEMP/quota.json"
+          grep -q '"buckets"' "$RUNNER_TEMP/quota.json"
+
+      - name: Package
+        run: |
+          NAME="opencode-${{ matrix.plat }}-quota"
+          mkdir -p out
+          if [ -n "${{ matrix.ext }}" ]; then
+            ( cd "packages/cli/dist/${{ matrix.dist }}/bin" && 7z a "../../../out/$NAME.zip" "opencode.exe" ) >/dev/null
+          else
+            tar -czf "out/$NAME.tar.gz" -C "packages/cli/dist/${{ matrix.dist }}/bin" .
+          fi
+          ( cd out && sha256sum ./* > "SHA256SUMS-${{ matrix.plat }}.txt" )
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: opencode-${{ matrix.plat }}
+          path: out/*
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Attach to release
+        if: inputs.release != ''
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release view "${{ inputs.release }}" >/dev/null 2>&1 || \
+            gh release create "${{ inputs.release }}" --generate-notes --title "${{ inputs.release }}"
+          gh release upload "${{ inputs.release }}" out/* --clobber

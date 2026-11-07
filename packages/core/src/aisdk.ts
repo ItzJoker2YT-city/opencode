@@ -33,6 +33,7 @@ import {
   type UsageInput,
 } from "@opencode/ai/effect"
 import { Auth, Endpoint, ProviderShared, RequestExecutor, type AnyRoute, type HttpMiddleware } from "@opencode/ai/route"
+import { QuotaLedger } from "@opencode/util/quota-ledger"
 import { isRecord } from "@opencode/util/record"
 import { Cause, Context, Effect, Layer, Option, Schema, Scope, Stream, Struct } from "effect"
 import { makeParser } from "effect/encoding/Sse"
@@ -135,6 +136,12 @@ function prepareOptions(model: RuntimeInfo, pkg: string, outbound: Fetch) {
   const customFetch = settings.fetch
   const timeouts = Provider.timeouts(settings)
   options.fetch = async (input: Parameters<typeof fetch>[0], init?: RequestInit) => {
+    const quotaKey = `${model.canonical ?? model.providerID}/${model.modelID}`
+    const gated = QuotaLedger.blocked(quotaKey)
+    if (gated)
+      throw new Error(
+        `[quota-ledger] ${quotaKey} hit the provider's daily limit; resets ${QuotaLedger.humanize(gated.blockedUntil ?? 0)}. Run "opencode quota --reset" to clear the local ledger.`,
+      )
     const opts = { ...(init ?? {}) }
     // A plain AbortSignal.timeout would keep running into the body stream, so the header limit uses
     // a timer that is cleared once headers arrive. The whole-request limit is meant to span the body.
@@ -167,6 +174,7 @@ function prepareOptions(model: RuntimeInfo, pkg: string, outbound: Fetch) {
         ? throughMiddleware(middleware, send, input, { ...opts, timeout: false })
         : send(input, { ...opts, timeout: false })
     ).finally(() => clearTimeout(headerTimer))
+    await QuotaLedger.observe(quotaKey, res)
     if (timeouts.chunkTimeout === false) return res
     return wrapSSE(res, timeouts.chunkTimeout, chunks)
   }

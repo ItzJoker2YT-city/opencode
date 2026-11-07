@@ -72,6 +72,11 @@ export const policy = Effect.gen(function* () {
   return (input: Input) =>
     Effect.gen(function* () {
       const now = yield* Clock.currentTimeMillis
+      // A daily free-tier quota is not transient: retrying only re-fails until the horizon the
+      // server named. Surface the error (with the ledger's reset note) instead of burning the
+      // general retry allowance against a dead bucket.
+      if (input.cause.reason._tag === "QuotaExceeded" && input.cause.reason.body?.includes("FreeUsageLimitError"))
+        return undefined
       // Unreachable failures don't spend the general allowance, so a flaky link that also drops streams keeps it.
       const next = yield* (input.retry && isUnreachable(input.cause) ? unreachable : step)(now, input).pipe(
         Pull.catchDone(() => Effect.succeed(undefined)),

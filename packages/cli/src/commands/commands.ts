@@ -361,6 +361,17 @@ const Root = Spec.make(typeof OPENCODE_CLI_NAME === "string" ? OPENCODE_CLI_NAME
         json: Flag.Boolean("json").pipe(Flag.withDescription("Output statistics as JSON"), Flag.withDefault(false)),
       },
     }),
+    Spec.make("quota", {
+      description: "Show or clear the local daily-limit ledger",
+      params: {
+        reset: Flag.Boolean("reset").pipe(
+          Flag.withDescription("Zero the counters and clear recorded blocks"),
+          Flag.withDefault(false),
+        ),
+        json: Flag.Boolean("json").pipe(Flag.withDescription("Output the ledger as JSON"), Flag.withDefault(false)),
+        key: Flag.String("key").pipe(Flag.withDescription("Only reset this provider/model key"), Flag.optional),
+      },
+    }),
     Spec.make("mini", {
       description: "Start the minimal interactive interface",
       globalFlags: ServerFlags,

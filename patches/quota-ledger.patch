@@ -1,0 +1,542 @@
+diff --git a/.github/workflows/build-patched.yml b/.github/workflows/build-patched.yml
+new file mode 100644
+index 0000000..df9090d
+--- /dev/null
++++ b/.github/workflows/build-patched.yml
+@@ -0,0 +1,124 @@
++name: build-patched
++
++# Builds the patched CLI on GitHub runners ("Actions as a build VM"):
++# checks out an optional upstream ref, applies the quota patch, compiles the
++# standalone binary, smoke-tests the new `quota` subcommand, and uploads
++# per-platform artifacts (optionally attaching them to a release).
++
++on:
++  workflow_dispatch:
++    inputs:
++      ref:
++        description: "Git ref to build (branch/tag/sha). Empty = the ref dispatched from."
++        required: false
++        default: ""
++      patch:
++        description: "Patch file in this repo to apply before building"
++        required: false
++        default: "patches/quota-ledger.patch"
++      release:
++        description: "Attach the artifacts to this release tag (optional)"
++        required: false
++        default: ""
++
++concurrency:
++  group: build-patched-${{ github.ref }}-${{ inputs.ref }}
++  cancel-in-progress: true
++
++permissions:
++  contents: write
++
++jobs:
++  build:
++    strategy:
++      fail-fast: false
++      matrix:
++        include:
++          - os: ubuntu-24.04
++            plat: linux-x64
++            dist: cli-linux-x64
++            ext: ""
++          - os: ubuntu-24.04-arm
++            plat: linux-arm64
++            dist: cli-linux-arm64
++            ext: ""
++          - os: windows-2025
++            plat: windows-x64
++            dist: cli-win32-x64
++            ext: ".exe"
++    runs-on: ${{ matrix.os }}
++    timeout-minutes: 60
++    defaults:
++      run:
++        shell: bash
++    steps:
++      - name: Checkout repository
++        uses: actions/checkout@v4
++        with:
++          fetch-depth: 0
++
++      - name: Stage patch
++        run: cp "${{ inputs.patch }}" "$RUNNER_TEMP/quota.patch"
++
++      - name: Checkout target ref
++        if: inputs.ref != ''
++        run: |
++          git fetch origin "${{ inputs.ref }}"
++          git checkout -f FETCH_HEAD
++
++      - name: Apply patch
++        run: |
++          git apply -v --3way "$RUNNER_TEMP/quota.patch"
++          git diff --stat
++
++      - name: Setup Node
++        uses: actions/setup-node@v4
++        with:
++          node-version: "24"
++
++      - name: Setup Bun
++        uses: ./.github/actions/setup-bun
++
++      - name: Install dependencies
++        run: bun install --frozen-lockfile
++
++      - name: Build patched binary
++        working-directory: packages/cli
++        timeout-minutes: 45
++        run: bun run script/build.ts --single --skip-install
++
++      - name: Smoke test
++        run: |
++          BIN="packages/cli/dist/${{ matrix.dist }}/bin/opencode${{ matrix.ext }}"
++          test -f "$BIN"
++          "$BIN" --version
++          "$BIN" quota --json | tee "$RUNNER_TEMP/quota.json"
++          grep -q '"buckets"' "$RUNNER_TEMP/quota.json"
++
++      - name: Package
++        run: |
++          NAME="opencode-${{ matrix.plat }}-quota"
++          mkdir -p out
++          if [ -n "${{ matrix.ext }}" ]; then
++            ( cd "packages/cli/dist/${{ matrix.dist }}/bin" && 7z a "../../../out/$NAME.zip" "opencode.exe" ) >/dev/null
++          else
++            tar -czf "out/$NAME.tar.gz" -C "packages/cli/dist/${{ matrix.dist }}/bin" .
++          fi
++          ( cd out && sha256sum ./* > "SHA256SUMS-${{ matrix.plat }}.txt" )
++
++      - name: Upload artifact
++        uses: actions/upload-artifact@v4
++        with:
++          name: opencode-${{ matrix.plat }}
++          path: out/*
++          if-no-files-found: error
++          retention-days: 14
++
++      - name: Attach to release
++        if: inputs.release != ''
++        env:
++          GH_TOKEN: ${{ github.token }}
++        run: |
++          gh release view "${{ inputs.release }}" >/dev/null 2>&1 || \
++            gh release create "${{ inputs.release }}" --generate-notes --title "${{ inputs.release }}"
++          gh release upload "${{ inputs.release }}" out/* --clobber
+diff --git a/packages/cli/src/commands/commands.ts b/packages/cli/src/commands/commands.ts
+index 5ca37aa..092dfc7 100644
+--- a/packages/cli/src/commands/commands.ts
++++ b/packages/cli/src/commands/commands.ts
+@@ -361,6 +361,17 @@ const Root = Spec.make(typeof OPENCODE_CLI_NAME === "string" ? OPENCODE_CLI_NAME
+         json: Flag.Boolean("json").pipe(Flag.withDescription("Output statistics as JSON"), Flag.withDefault(false)),
+       },
+     }),
++    Spec.make("quota", {
++      description: "Show or clear the local daily-limit ledger",
++      params: {
++        reset: Flag.Boolean("reset").pipe(
++          Flag.withDescription("Zero the counters and clear recorded blocks"),
++          Flag.withDefault(false),
++        ),
++        json: Flag.Boolean("json").pipe(Flag.withDescription("Output the ledger as JSON"), Flag.withDefault(false)),
++        key: Flag.String("key").pipe(Flag.withDescription("Only reset this provider/model key"), Flag.optional),
++      },
++    }),
+     Spec.make("mini", {
+       description: "Start the minimal interactive interface",
+       globalFlags: ServerFlags,
+diff --git a/packages/cli/src/commands/handlers/quota.ts b/packages/cli/src/commands/handlers/quota.ts
+new file mode 100644
+index 0000000..cce0ef1
+--- /dev/null
++++ b/packages/cli/src/commands/handlers/quota.ts
+@@ -0,0 +1,35 @@
++import { EOL } from "os"
++import { Effect, Option } from "effect"
++import { QuotaLedger } from "@opencode/util/quota-ledger"
++import { Commands } from "../commands"
++import { Runtime } from "../../framework/runtime"
++
++export default Runtime.handler(
++  Commands.commands.quota,
++  Effect.fn("cli.quota")(function* (input) {
++    const key = Option.getOrUndefined(input.key)
++    if (input.reset) {
++      QuotaLedger.reset(key)
++      process.stdout.write(`quota ledger reset${key === undefined ? "" : ` (${key})`}${EOL}`)
++      return
++    }
++    const state = QuotaLedger.read()
++    if (input.json) {
++      process.stdout.write(JSON.stringify(state, null, 2) + EOL)
++      return
++    }
++    const entries = Object.entries(state.buckets)
++    if (entries.length === 0) {
++      process.stdout.write(`no usage recorded today (${state.day})${EOL}`)
++      return
++    }
++    for (const [name, bucket] of entries) {
++      const gated =
++        bucket.blockedUntil && bucket.blockedUntil > Date.now()
++          ? ` blocked, resets ${QuotaLedger.humanize(bucket.blockedUntil)}`
++          : ""
++      const raw = bucket.resetRaw ? ` [${bucket.resetRaw}]` : ""
++      process.stdout.write(`${name.padEnd(40)} used=${String(bucket.used).padStart(3)}${gated}${raw}${EOL}`)
++    }
++  }),
++)
+diff --git a/packages/cli/src/index.ts b/packages/cli/src/index.ts
+index 267bd24..e6b245a 100755
+--- a/packages/cli/src/index.ts
++++ b/packages/cli/src/index.ts
+@@ -76,6 +76,7 @@ const Handlers = Runtime.handlers(Commands, {
+   },
+   models: () => import("./commands/handlers/models"),
+   stats: () => import("./commands/handlers/stats"),
++  quota: () => import("./commands/handlers/quota"),
+   mini: () => import("./commands/handlers/mini"),
+   run: () => import("./commands/handlers/run"),
+   pair: () => import("./commands/handlers/pair"),
+diff --git a/packages/core/src/aisdk.ts b/packages/core/src/aisdk.ts
+index 51c31c6..0e179d1 100644
+--- a/packages/core/src/aisdk.ts
++++ b/packages/core/src/aisdk.ts
+@@ -33,6 +33,7 @@ import {
+   type UsageInput,
+ } from "@opencode/ai/effect"
+ import { Auth, Endpoint, ProviderShared, RequestExecutor, type AnyRoute, type HttpMiddleware } from "@opencode/ai/route"
++import { QuotaLedger } from "@opencode/util/quota-ledger"
+ import { isRecord } from "@opencode/util/record"
+ import { Cause, Context, Effect, Layer, Option, Schema, Scope, Stream, Struct } from "effect"
+ import { makeParser } from "effect/encoding/Sse"
+@@ -135,6 +136,12 @@ function prepareOptions(model: RuntimeInfo, pkg: string, outbound: Fetch) {
+   const customFetch = settings.fetch
+   const timeouts = Provider.timeouts(settings)
+   options.fetch = async (input: Parameters<typeof fetch>[0], init?: RequestInit) => {
++    const quotaKey = `${model.canonical ?? model.providerID}/${model.modelID}`
++    const gated = QuotaLedger.blocked(quotaKey)
++    if (gated)
++      throw new Error(
++        `[quota-ledger] ${quotaKey} hit the provider's daily limit; resets ${QuotaLedger.humanize(gated.blockedUntil ?? 0)}. Run "opencode quota --reset" to clear the local ledger.`,
++      )
+     const opts = { ...(init ?? {}) }
+     // A plain AbortSignal.timeout would keep running into the body stream, so the header limit uses
+     // a timer that is cleared once headers arrive. The whole-request limit is meant to span the body.
+@@ -167,6 +174,7 @@ function prepareOptions(model: RuntimeInfo, pkg: string, outbound: Fetch) {
+         ? throughMiddleware(middleware, send, input, { ...opts, timeout: false })
+         : send(input, { ...opts, timeout: false })
+     ).finally(() => clearTimeout(headerTimer))
++    await QuotaLedger.observe(quotaKey, res)
+     if (timeouts.chunkTimeout === false) return res
+     return wrapSSE(res, timeouts.chunkTimeout, chunks)
+   }
+diff --git a/packages/core/src/model-retry.ts b/packages/core/src/model-retry.ts
+index 9ec5dbd..d05dbe5 100644
+--- a/packages/core/src/model-retry.ts
++++ b/packages/core/src/model-retry.ts
+@@ -72,6 +72,11 @@ export const policy = Effect.gen(function* () {
+   return (input: Input) =>
+     Effect.gen(function* () {
+       const now = yield* Clock.currentTimeMillis
++      // A daily free-tier quota is not transient: retrying only re-fails until the horizon the
++      // server named. Surface the error (with the ledger's reset note) instead of burning the
++      // general retry allowance against a dead bucket.
++      if (input.cause.reason._tag === "QuotaExceeded" && input.cause.reason.body?.includes("FreeUsageLimitError"))
++        return undefined
+       // Unreachable failures don't spend the general allowance, so a flaky link that also drops streams keeps it.
+       const next = yield* (input.retry && isUnreachable(input.cause) ? unreachable : step)(now, input).pipe(
+         Pull.catchDone(() => Effect.succeed(undefined)),
+diff --git a/packages/core/src/session/to-session-error.ts b/packages/core/src/session/to-session-error.ts
+index 91c9054..2e8167b 100644
+--- a/packages/core/src/session/to-session-error.ts
++++ b/packages/core/src/session/to-session-error.ts
+@@ -6,6 +6,7 @@ import { Integration } from "../integration.js"
+ import { AgentNotFoundError, StepFailedError } from "./error.js"
+ import { ModelResolver } from "../model-resolver.js"
+ import { ModelRetry } from "../model-retry.js"
++import { QuotaLedger } from "@opencode/util/quota-ledger"
+ import { SessionRunnerModel } from "./runner/model.js"
+ 
+ const tokenSharingMessages = {
+@@ -43,7 +44,10 @@ export function toSessionError(cause: unknown): SessionError.Error {
+         return providerError("provider.auth", cause.reason)
+       case "QuotaExceeded":
+         if (cause.reason.body?.includes("FreeUsageLimitError"))
+-          return { ...providerError("provider.free-limit", cause.reason), message: FREE_USAGE_LIMIT_MESSAGE }
++          return {
++            ...providerError("provider.free-limit", cause.reason),
++            message: [FREE_USAGE_LIMIT_MESSAGE, QuotaLedger.recentBlockedNote()].filter(Boolean).join(" "),
++          }
+         if (cause.reason.body?.includes("BudgetLimitError")) return budgetLimit(cause.reason)
+         if (cause.reason.body?.includes("GoUsageLimitError")) return goLimit(cause.reason)
+         return providerError("provider.quota", cause.reason)
+diff --git a/packages/util/src/quota-ledger.ts b/packages/util/src/quota-ledger.ts
+new file mode 100644
+index 0000000..1c11a74
+--- /dev/null
++++ b/packages/util/src/quota-ledger.ts
+@@ -0,0 +1,258 @@
++export * as QuotaLedger from "./quota-ledger.js"
++
++// Local, advisory-only ledger of provider daily-limit responses. The upstream
++// (OpenCode Console/Zen) quota is enforced server-side and only the service can
++// raise or clear it; this file records what the server told this client, so the
++// session can show a real reset time and `opencode quota --reset` can clear the
++// local view when the recorded horizon has passed.
++
++import fs from "node:fs"
++import path from "node:path"
++import { Path } from "./global.js"
++
++export interface Bucket {
++  used: number
++  limit: number | null
++  blockedUntil: number | null
++  resetRaw: string | null
++  lastStatus: number | null
++  lastError: string | null
++  updatedAt: number
++}
++
++export interface Ledger {
++  version: 1
++  day: string
++  buckets: Record<string, Bucket>
++}
++
++const FILE = path.join(Path.state, "quota-ledger.json")
++
++/** Blocks longer than this gate requests before they are sent; shorter windows stay with the retry schedule. */
++const GATE_MINIMUM_MS = 10 * 60_000
++
++function today() {
++  const now = new Date()
++  return `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, "0")}-${String(now.getDate()).padStart(2, "0")}`
++}
++
++function empty(): Ledger {
++  return { version: 1, day: today(), buckets: {} }
++}
++
++export function read(): Ledger {
++  let state: Ledger | undefined
++  try {
++    state = JSON.parse(fs.readFileSync(FILE, "utf8")) as Ledger
++  } catch {
++    return empty()
++  }
++  // A new local day rolls the counters; unknown versions are ignored wholesale.
++  if (state.version !== 1 || state.day !== today()) return empty()
++  return state
++}
++
++function write(state: Ledger) {
++  // The ledger must never break a model call, so every failure is swallowed.
++  try {
++    fs.mkdirSync(Path.state, { recursive: true })
++    const tmp = `${FILE}.${process.pid}.tmp`
++    fs.writeFileSync(tmp, JSON.stringify(state, null, 2))
++    fs.renameSync(tmp, FILE)
++  } catch {}
++}
++
++function slot(state: Ledger, key: string): Bucket {
++  state.buckets[key] ??= {
++    used: 0,
++    limit: null,
++    blockedUntil: null,
++    resetRaw: null,
++    lastStatus: null,
++    lastError: null,
++    updatedAt: 0,
++  }
++  return state.buckets[key]
++}
++
++export function bump(key: string) {
++  const state = read()
++  const bucket = slot(state, key)
++  bucket.used++
++  bucket.updatedAt = Date.now()
++  write(state)
++}
++
++export function block(
++  key: string,
++  input: { until: number | null; raw: string | null; status: number; error: string },
++): Bucket {
++  const state = read()
++  const bucket = slot(state, key)
++  bucket.blockedUntil = input.until
++  bucket.resetRaw = input.raw
++  bucket.lastStatus = input.status
++  bucket.lastError = input.error
++  bucket.updatedAt = Date.now()
++  // The server refused for quota with a known horizon, so today's allowance is spent.
++  if (input.until !== null && input.until > Date.now()) bucket.limit = bucket.used
++  write(state)
++  return bucket
++}
++
++/** The bucket's block, if it is still active and long enough to gate a request. */
++export function blocked(key: string): Bucket | undefined {
++  const bucket = read().buckets[key]
++  if (!bucket?.blockedUntil) return undefined
++  if (bucket.blockedUntil <= Date.now() + GATE_MINIMUM_MS) return undefined
++  return bucket
++}
++
++export function reset(key?: string): Ledger {
++  const state = read()
++  state.buckets =
++    key === undefined ? {} : Object.fromEntries(Object.entries(state.buckets).filter(([name]) => name !== key))
++  write(state)
++  return state
++}
++
++/** The most recent 429-quota block recorded for any key, for messages that cannot know the model key. */
++export function recentBlocked(): { key: string; bucket: Bucket } | undefined {
++  const entries = Object.entries(read().buckets).filter(([, bucket]) => bucket.lastStatus === 429)
++  if (entries.length === 0) return undefined
++  return entries.reduce((a, b) => (b[1].updatedAt > a[1].updatedAt ? b : a))
++}
++
++export function recentBlockedNote(): string {
++  const recent = recentBlocked()
++  if (!recent) return ""
++  const when = recent.bucket.blockedUntil ? humanize(recent.bucket.blockedUntil) : "at an unknown time"
++  return `(ledger: ${recent.key} used ${recent.bucket.used} today, resets ${when}; clear locally with "opencode quota --reset")`
++}
++
++export function humanize(ms: number): string {
++  const delta = ms - Date.now()
++  if (delta <= 0) return "now"
++  const minutes = Math.round(delta / 60_000)
++  if (minutes < 60) return `in ${minutes}m`
++  return `in ${Math.floor(minutes / 60)}h ${minutes % 60}m`
++}
++
++// ---------- reset-time extraction from provider responses ----------
++
++const MONTHS = [
++  "january",
++  "february",
++  "march",
++  "april",
++  "may",
++  "june",
++  "july",
++  "august",
++  "september",
++  "october",
++  "november",
++  "december",
++]
++
++// Time-zone abbreviations the Console is known to print, mapped to fixed offsets. Anything else
++// falls back to local time, which can be off by hours for zones with daylight saving.
++const TZ_OFFSET_MINUTES: Record<string, number> = {
++  UTC: 0,
++  GMT: 0,
++  IST: 330,
++  BST: 60,
++  CET: 60,
++  CEST: 120,
++  EET: 120,
++  EEST: 180,
++  EST: -300,
++  EDT: -240,
++  CST: -360,
++  CDT: -300,
++  MST: -420,
++  MDT: -360,
++  PST: -480,
++  PDT: -420,
++}
++
++export function parseReset(body: string | undefined, headers: Headers): { at: number | null; raw: string | null } {
++  const retryAfter = headers.get("retry-after")
++  if (retryAfter) {
++    if (/^\d+$/.test(retryAfter.trim()))
++      return { at: Date.now() + Number(retryAfter) * 1000, raw: `retry-after: ${retryAfter}` }
++    const parsed = Date.parse(retryAfter)
++    if (!Number.isNaN(parsed)) return { at: parsed, raw: `retry-after: ${retryAfter}` }
++  }
++
++  const text = body ?? ""
++
++  const epoch = /"(?:resets?_?at|resetAt|retryAt)"\s*:\s*(\d{10,13})\b/.exec(text)
++  if (epoch) {
++    const value = Number(epoch[1])
++    return { at: epoch[1].length >= 13 ? value : value * 1000, raw: epoch[0] }
++  }
++
++  const iso = /\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}(?::\d{2})?(?:Z|[+-]\d{2}:?\d{2})?/.exec(text)
++  if (iso) {
++    const parsed = Date.parse(iso[0].replace(" ", "T"))
++    if (!Number.isNaN(parsed)) return { at: parsed, raw: iso[0] }
++  }
++
++  // "resets on October 29, 2026, at 5:30 AM IST" / "wait until October 30, 2026, at 5:30 AM"
++  const absolute =
++    /reset[s]?\s*(?:at|on|in)?\s*([A-Za-z]+)\s+(\d{1,2}),?\s*(\d{4})?,?\s*(?:at\s*)?(\d{1,2}):(\d{2})\s*(AM|PM)?\s*([A-Za-z]{2,5})?/i.exec(
++      text,
++    )
++  if (absolute) {
++    const month = MONTHS.indexOf(absolute[1].toLowerCase())
++    if (month >= 0) {
++      const year = absolute[3] ? Number(absolute[3]) : new Date().getFullYear()
++      let hours = Number(absolute[4])
++      const meridiem = absolute[6]?.toUpperCase()
++      if (meridiem === "PM" && hours < 12) hours += 12
++      if (meridiem === "AM" && hours === 12) hours = 0
++      const offset = absolute[7] ? TZ_OFFSET_MINUTES[absolute[7].toUpperCase()] : undefined
++      const at =
++        offset === undefined
++          ? new Date(year, month, Number(absolute[2]), hours, Number(absolute[5])).getTime()
++          : Date.UTC(year, month, Number(absolute[2]), hours, Number(absolute[5])) - offset * 60_000
++      if (!Number.isNaN(at)) return { at, raw: absolute[0] }
++    }
++  }
++
++  const relative =
++    /(?:reset[s]?|try again|retry)\s+(?:in|after)\s+(?:(\d+)\s*d(?:ays?)?)?\s*(?:(\d+)\s*h(?:ours?|rs?)?)?\s*(?:(\d+)\s*m(?:in(?:utes?)?)?)?/i.exec(
++      text,
++    )
++  if (relative && (relative[1] || relative[2] || relative[3])) {
++    const ms =
++      Number(relative[1] ?? 0) * 86_400_000 + Number(relative[2] ?? 0) * 3_600_000 + Number(relative[3] ?? 0) * 60_000
++    if (ms > 0) return { at: Date.now() + ms, raw: relative[0] }
++  }
++
++  return { at: null, raw: null }
++}
++
++/**
++ * Inspect a provider response after it comes back from the wire: bump the daily counter on
++ * success, record the block with its parsed reset horizon on 429/403. The response itself is
++ * returned untouched, so the caller's handling (retry schedule, error mapping) is unchanged.
++ */
++export async function observe(key: string, res: Response): Promise<Response> {
++  if (res.ok) {
++    bump(key)
++    return res
++  }
++  const status = res.status
++  if (status !== 429 && status !== 403) return res
++  let text: string | undefined
++  try {
++    text = await res.clone().text()
++  } catch {
++    text = undefined
++  }
++  const parsed = parseReset(text, res.headers)
++  block(key, { until: parsed.at, raw: parsed.raw, status, error: (text ?? "").slice(0, 400) })
++  return res
++}

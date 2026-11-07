@@ -6,6 +6,7 @@ import { Integration } from "../integration.js"
 import { AgentNotFoundError, StepFailedError } from "./error.js"
 import { ModelResolver } from "../model-resolver.js"
 import { ModelRetry } from "../model-retry.js"
+import { QuotaLedger } from "@opencode/util/quota-ledger"
 import { SessionRunnerModel } from "./runner/model.js"
 
 const tokenSharingMessages = {
@@ -43,7 +44,10 @@ export function toSessionError(cause: unknown): SessionError.Error {
         return providerError("provider.auth", cause.reason)
       case "QuotaExceeded":
         if (cause.reason.body?.includes("FreeUsageLimitError"))
-          return { ...providerError("provider.free-limit", cause.reason), message: FREE_USAGE_LIMIT_MESSAGE }
+          return {
+            ...providerError("provider.free-limit", cause.reason),
+            message: [FREE_USAGE_LIMIT_MESSAGE, QuotaLedger.recentBlockedNote()].filter(Boolean).join(" "),
+          }
         if (cause.reason.body?.includes("BudgetLimitError")) return budgetLimit(cause.reason)
         if (cause.reason.body?.includes("GoUsageLimitError")) return goLimit(cause.reason)
         return providerError("provider.quota", cause.reason)
