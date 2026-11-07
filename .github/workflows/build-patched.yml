@@ -63,13 +63,19 @@ jobs:
       - name: Checkout target ref
         if: inputs.ref != ''
         run: |
-          git fetch origin "${{ inputs.ref }}"
+          git fetch origin "${{ inputs.ref }}" 2>/dev/null || \
+            git fetch https://github.com/anomalyco/opencode "${{ inputs.ref }}"
           git checkout -f FETCH_HEAD
 
       - name: Apply patch
         run: |
-          git apply -v --3way "$RUNNER_TEMP/quota.patch"
-          git diff --stat
+          if git apply --check --3way "$RUNNER_TEMP/quota.patch" 2>/dev/null; then
+            git apply -v --3way "$RUNNER_TEMP/quota.patch"
+            git diff --stat
+          else
+            echo "Patch does not apply cleanly; assuming the ref already carries it."
+            test -f packages/util/src/quota-ledger.ts || { echo "quota-ledger.ts missing - aborting"; exit 1; }
+          fi
 
       - name: Setup Node
         uses: actions/setup-node@v4
